@@ -1,0 +1,4 @@
+venv/
+__pycache__/
+*.pyc
+TCP-IP-Python-V4/.git/

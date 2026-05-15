@@ -1,0 +1,191 @@
+<mujoco model="MG400_URDF">
+  <compiler angle="degree" meshdir="urdf_meshes"/>
+
+  <option timestep="0.001" integrator="RK4" gravity="0 0 -9.81"/>
+
+  <default>
+    <geom contype="0" conaffinity="0" condim="3"/>
+    <joint damping="1.5" armature="0.05"/>
+    <position kp="200" kv="25"/>
+  </default>
+
+  <visual>
+    <map fogstart="5" fogend="8" znear="0.001"/>
+    <global offwidth="1200" offheight="900"/>
+  </visual>
+
+  <asset>
+    <texture name="tex_sky" type="skybox" builtin="gradient"
+             rgb1="0.55 0.65 0.85" rgb2="0.85 0.90 0.95" width="512" height="512"/>
+    <texture name="tex_floor" type="2d" builtin="checker"
+             rgb1="0.45 0.60 0.85" rgb2="0.94 0.96 1.00" width="256" height="256"/>
+    <material name="mat_floor" texture="tex_floor" texrepeat="24 24"
+              specular="0.15" shininess="0.1" reflectance="0.05"/>
+
+    <mesh name="m_base"   file="base_link.stl"/>
+    <mesh name="m_link1"  file="link1.stl"/>
+    <mesh name="m_link21" file="link2_1.stl"/>
+    <mesh name="m_link22" file="link2_2.stl"/>
+    <mesh name="m_link31" file="link3_1.stl"/>
+    <mesh name="m_link32" file="link3_2.stl"/>
+    <mesh name="m_link41" file="link4_1.stl"/>
+    <mesh name="m_link42" file="link4_2.stl"/>
+    <mesh name="m_link43" file="link4_3.stl"/>
+    <mesh name="m_link5"  file="link5.stl"/>
+    <mesh name="m_flange" file="flange.stl"/>
+
+    <mesh name="m_workspace" file="workspace_cage.obj"/>
+    <material name="mat_workspace" rgba="0.20 0.60 0.75 0.40" specular="0.10" shininess="0.10"/>
+
+    <material name="mat_base"   rgba="0.35 0.35 0.40 1" specular="0.4" shininess="0.4"/>
+    <material name="mat_j1"     rgba="0.25 0.40 0.55 1" specular="0.4" shininess="0.4"/>
+    <material name="mat_main"   rgba="0.30 0.50 0.60 1" specular="0.4" shininess="0.4"/>
+    <material name="mat_para"   rgba="0.22 0.40 0.50 1" specular="0.3" shininess="0.3"/>
+    <material name="mat_j4"     rgba="0.35 0.55 0.65 1" specular="0.4" shininess="0.4"/>
+    <material name="mat_j5"     rgba="0.40 0.60 0.70 1" specular="0.4" shininess="0.4"/>
+    <material name="mat_joint"  rgba="0.85 0.35 0.15 1" specular="0.5" shininess="0.6"/>
+  </asset>
+
+  <worldbody>
+    <light name="light_key" directional="true" diffuse="0.75 0.75 0.75"
+           specular="0.3 0.3 0.3" pos="2 1.5 3" dir="-0.5 -0.3 -1"/>
+    <light name="light_fill" directional="true" diffuse="0.25 0.25 0.3"
+           specular="0.05 0.05 0.05" pos="-1.5 1 2" dir="0.4 -0.2 -1"/>
+
+    <geom name="floor" type="plane" pos="0 0 0" size="3 3 0.1"
+          material="mat_floor" contype="1" conaffinity="1"/>
+
+    <!-- 1000mm*1000mm 半透明阴影区, 世界中心 -->
+    <geom name="shadow" type="plane" pos="0 0 0.0005" size="0.5 0.5 0.1"
+          rgba="0.05 0.08 0.15 0.50" contype="0" conaffinity="0"/>
+
+    <!-- 工作空间包络 cage — 内边界, 标记不可达区域 -->
+    <geom name="workspace_cage" type="mesh" mesh="m_workspace" pos="0 0 0"
+          material="mat_workspace" contype="0" conaffinity="0" euler="0 0 0"/>
+
+    <!-- 目标点标记 (mocap, 控制面板发送目标后显示) -->
+    <body name="target_marker" mocap="true" pos="0.3 0 0.19">
+      <geom name="target_dot" type="sphere" size="0.008" rgba="1 0.35 0.1 0.9" contype="0" conaffinity="0"/>
+    </body>
+
+
+    <!-- Frame0: 世界中心, 细长坐标轴 -->
+    <body name="frame0" pos="0 0 0.002" mocap="true">
+      <geom name="f0_x" type="cylinder" size="0.0015" fromto="0 0 0  0.22 0 0"
+            rgba="1 0.15 0.15 0.9" contype="0" conaffinity="0"/>
+      <geom name="f0_y" type="cylinder" size="0.0015" fromto="0 0 0  0 0.22 0"
+            rgba="0.15 1 0.15 0.9" contype="0" conaffinity="0"/>
+      <geom name="f0_z" type="cylinder" size="0.0015" fromto="0 0 0  0 0 0.22"
+            rgba="0.15 0.15 1 0.9" contype="0" conaffinity="0"/>
+      <site name="S0" pos="0 0 0" size="0.004" type="sphere" rgba="1 1 1 0.95"/>
+    </body>
+
+    <!-- ═══ base_link — 世界中心, 机身沿对角线45° ═══ -->
+    <body name="base" pos="0 0 0" euler="0 0 45">
+      <geom name="base_mesh" type="mesh" mesh="m_base" pos="0 0 0" material="mat_base" euler="0 0 0"/>
+
+      <!-- J1: URDF origin (-0.005, 0, 0.109) from base_link -->
+      <body name="link1" pos="-0.005 0 0.109">
+        <joint name="J1" type="hinge" axis="0 0 1" range="-160 160"/>
+        <geom name="j1_mesh" type="mesh" mesh="m_link1" pos="0 0 0" material="mat_j1" euler="0 0 0"/>
+
+        <!-- ════════════════════════════════════════════ -->
+        <!-- 主链: link1 → J2 → link2_1 → J3 → fake_link → J31 → link3_1 → J41 → link4_1 → J4 → link5 -->
+        <!-- ════════════════════════════════════════════ -->
+
+        <!-- J2: (0.0435, -0.035775, 0.119) from link1 -->
+        <body name="link2_1" pos="0.0435 -0.035775 0.119">
+          <joint name="J2" type="hinge" axis="0 1 0" range="-25 85"/>
+          <geom name="j2_mesh" type="mesh" mesh="m_link21" pos="0 0 0" material="mat_main" euler="0 0 0"/>
+
+          <!-- J3: (-0.00105, 0.035775, 0.175) from link2_1 → fake_link -->
+          <body name="fake_link" pos="-0.00105 0.035775 0.175">
+            <joint name="J3" type="hinge" axis="0 1 0" range="-25 105"/>
+            <geom name="fake_mass" type="sphere" size="0.001" rgba="0 0 0 0" mass="0.001"/>
+
+            <!-- J31: fake_link → link3_1, origin not specified = (0,0,0), mimic -J2 -->
+            <body name="link3_1" pos="0 0 0">
+              <joint name="J31" type="hinge" axis="0 1 0" range="-180 180"/>
+              <geom name="j3_mesh" type="mesh" mesh="m_link31" pos="0 0 0" material="mat_main" euler="0 0 0"/>
+
+              <!-- J41: (0.175, -0.017, 0.00325) from link3_1 → link4_1, mimic -J3 -->
+              <body name="link4_1" pos="0.175 -0.017 0.00325">
+                <joint name="J41" type="hinge" axis="0 1 0" range="-180 180"/>
+                <geom name="j4_mesh" type="mesh" mesh="m_link41" pos="0 0 0" material="mat_j4" euler="0 0 0"/>
+                <!-- 腕部外壳固定在 link4_1, 不随 J4 旋转 -->
+                <geom name="wrist_housing" type="mesh" mesh="m_link5" pos="0.066 0.017 0.031" material="mat_j5" euler="0 0 0"/>
+                <geom name="wrist_housing2" type="mesh" mesh="m_link43" pos="0.066 0.017 0.033" material="mat_j5" euler="0 0 0"/>
+
+                <!-- J4: (0.066, 0.017, 0.031) from link4_1 → link5, Z-axis -->
+                <body name="link5" pos="0.066 0.017 0.031">
+                  <joint name="J4" type="hinge" axis="0 0 1" range="-180 180"/>
+                  <!-- 仅法兰盘随 J4 旋转 -->
+                  <geom name="link5_placeholder" type="sphere" size="0.003" rgba="0 0 0 0" mass="0.01"/>
+
+                  <!-- flange: fixed on link5, offset (0, 0, -0.084) -->
+                  <body name="flange" pos="0 0 -0.084">
+                    <geom name="flange_mesh" type="mesh" mesh="m_flange" pos="0 0 0" material="mat_j5" euler="0 0 0"/>
+                    <!-- J4 旋转指示器: 法兰盘底部横条, 随法兰旋转 -->
+                    <geom name="j4_indicator" type="box" size="0.014 0.0025 0.0025"
+                          pos="0.008 0 -0.014" rgba="0.95 0.3 0.15 1"
+                          contype="0" conaffinity="0"/>
+                    <site name="tcp" pos="0 0 -0.01" size="0.005" type="sphere" rgba="1 0.5 0 0.95"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+
+        <!-- ════════════════════════════════════════════ -->
+        <!-- 并行链: link1 → J22 → link2_2 → J32 → link3_2 → J42 → link4_2 -->
+        <!-- ════════════════════════════════════════════ -->
+
+        <!-- J22: (0.004529, -0.0305, 0.1415) from link1, mimic J2 -->
+        <body name="link2_2" pos="0.004529 -0.0305 0.1415">
+          <joint name="J22" type="hinge" axis="0 1 0" range="-180 180"/>
+          <geom name="j22_mesh" type="mesh" mesh="m_link22" pos="0 0 0" material="mat_para" euler="0 0 0"/>
+
+          <!-- J32: (-0.00105, 0.0065, 0.175) from link2_2, mimic -J2 -->
+          <body name="link3_2" pos="-0.00105 0.0065 0.175">
+            <joint name="J32" type="hinge" axis="0 1 0" range="-180 180"/>
+            <geom name="j32_mesh" type="mesh" mesh="m_link32" pos="0 0 0" material="mat_para" euler="0 0 0"/>
+
+            <!-- J42: (0.0679, 0.0005, 0.01197) from link3_2, mimic J3 -->
+            <body name="link4_2" pos="0.0679 0.0005 0.011972">
+              <joint name="J42" type="hinge" axis="0 1 0" range="-180 180"/>
+              <geom name="j42_mesh" type="mesh" mesh="m_link42" pos="0 0 0" material="mat_j4" euler="0 0 0"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- Mimic constraints matching URDF mimic/multiplier -->
+  <equality>
+    <joint name="eq_J22" joint1="J2"  joint2="J22" polycoef="0 1 0 0 0"/>   <!-- J22 = J2 -->
+    <joint name="eq_J32" joint1="J2"  joint2="J32" polycoef="0 -1 0 0 0"/>  <!-- J32 = -J2 -->
+    <joint name="eq_J31" joint1="J2"  joint2="J31" polycoef="0 -1 0 0 0"/>  <!-- J31 = -J2 -->
+    <joint name="eq_J42" joint1="J3"  joint2="J42" polycoef="0 1 0 0 0"/>   <!-- J42 = J3 -->
+    <joint name="eq_J41" joint1="J3"  joint2="J41" polycoef="0 -1 0 0 0"/>  <!-- J41 = -J3 -->
+  </equality>
+
+  <!-- 4-DOF actuators: J1, J2, J3, J4 -->
+  <actuator>
+    <position name="ctrl_J1" joint="J1" kp="400" kv="25" ctrlrange="-3.1416 3.1416"/>
+    <position name="ctrl_J2" joint="J2" kp="800" kv="35" ctrlrange="-0.436 1.484"/>
+    <position name="ctrl_J3" joint="J3" kp="600" kv="25" ctrlrange="-0.436 1.833"/>
+    <position name="ctrl_J4" joint="J4" kp="30"  kv="5"  ctrlrange="-3.1416 3.1416"/>
+  </actuator>
+
+  <sensor>
+    <jointpos name="J1_pos" joint="J1"/>
+    <jointvel name="J1_vel" joint="J1"/>
+    <jointpos name="J2_pos" joint="J2"/>
+    <jointvel name="J2_vel" joint="J2"/>
+    <jointpos name="J3_pos" joint="J3"/>
+    <jointvel name="J3_vel" joint="J3"/>
+    <framepos name="TCP_pos" objtype="site" objname="tcp"/>
+  </sensor>
+</mujoco>
