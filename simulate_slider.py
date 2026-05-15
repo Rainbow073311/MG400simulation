@@ -25,6 +25,8 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 
+import mg400_server
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 4 个被驱动关节在 qpos 中的索引
@@ -202,6 +204,77 @@ def _plan_safe_motion(cur, target_xyz, descent_seg_m=0.001, verbose_prefix=""):
     return wp_list
 
 
+# ── 障碍物检测与避障 ──
+
+def _get_robot_keypoints(data, tcp_site_id, model):
+    """获取机器人关键点世界坐标: TCP, 肘部, 腕部。"""
+    tcp = data.site_xpos[tcp_site_id].copy()
+    # 肘部近似: fake_link 的 body id
+    elbow_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "fake_link")
+    elbow = data.xpos[elbow_id].copy() if elbow_id >= 0 else tcp.copy()
+    # 腕部近似: link4_1 body
+    wrist_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "link4_1")
+    wrist = data.xpos[wrist_id].copy() if wrist_id >= 0 else tcp.copy()
+    return {"tcp": tcp, "elbow": elbow, "wrist": wrist}
+
+
+def _point_to_segment_dist(p, a, b):
+    """点到线段的最短距离 (世界坐标)。"""
+    ab = b - a
+    ap = p - a
+    t = np.clip(np.dot(ap, ab) / np.dot(ab, ab) if np.dot(ab, ab) > 1e-12 else 0.0, 0.0, 1.0)
+    return np.linalg.norm(ap - t * ab)
+
+
+def _obstacle_segment(obs_pos, half_len):
+    """障碍物线段端点 (世界坐标): 水平沿X轴, obs_pos为中心。"""
+    a = obs_pos + np.array([-half_len, 0.0, 0.0])
+    b = obs_pos + np.array([ half_len, 0.0, 0.0])
+    return a, b
+
+
+def _obstacle_distances(keypoints, obs_pos, obs_radius, half_len):
+    """计算机器人关键点到障碍物表面的距离 (m)。"""
+    a, b = _obstacle_segment(obs_pos, half_len)
+    dists = {}
+    for name, pt in keypoints.items():
+        seg_dist = _point_to_segment_dist(pt, a, b)
+        surf_dist = max(0.0, seg_dist - obs_radius)
+        dists[name] = {"center": seg_dist, "surface": surf_dist}
+    return dists
+
+
+def _obstacle_repulsion(tcp_pos, obs_pos, obs_radius, half_len, safe_dist=0.060, gain=0.08):
+    """计算障碍物对 TCP 的排斥向量 (世界坐标系, m)。
+    使用点到水平线段的距离, 模拟手臂横放。
+    safe_dist: 安全距离, 小于此距离开始排斥
+    gain: 排斥增益
+    返回 (repulsion_3d, min_surface_dist)"""
+    a, b = _obstacle_segment(obs_pos, half_len)
+    seg_dist = _point_to_segment_dist(tcp_pos, a, b)
+    surf_dist = max(0.0, seg_dist - obs_radius)
+    if surf_dist >= safe_dist:
+        return np.zeros(3), surf_dist
+    # 排斥方向: 线段上最近点指向TCP
+    ab = b - a
+    ap = tcp_pos - a
+    t = np.clip(np.dot(ap, ab) / np.dot(ab, ab) if np.dot(ab, ab) > 1e-12 else 0.0, 0.0, 1.0)
+    closest = a + t * ab
+    if seg_dist < 1e-6:
+        direction = np.array([0.0, 0.0, 1.0])
+    else:
+        direction = (tcp_pos - closest) / seg_dist
+    strength = gain * (1.0 - surf_dist / safe_dist) ** 2
+    return direction * strength, surf_dist
+
+
+def _check_path_blocked(waypoint, obs_pos, obs_radius, half_len, safe_dist=0.045):
+    """检查单个路径点是否被障碍物阻挡 (水平圆柱)。"""
+    a, b = _obstacle_segment(obs_pos, half_len)
+    dist = _point_to_segment_dist(np.asarray(waypoint), a, b)
+    return (dist - obs_radius) < safe_dist
+
+
 # ── Win32 鼠标轮询（不设 GLFW 回调，不与 viewer 冲突）──
 _user32 = ctypes.windll.user32
 
@@ -230,185 +303,30 @@ _HOME_TCP = None          # 原点姿态 TCP 世界坐标 (J1=J2=J3=J4=0)
 _WS_Z_WORLD = None        # 工作空间边界 Z 数组 (世界坐标, m)
 _WS_R_MIN = None          # 工作空间边界 R_min 数组 (世界坐标, m)
 _WS_R_MAX = None          # 工作空间边界 R_max 数组 (世界坐标, m)
-_ext_lock = threading.Lock()
-_ext_target = None       # [x, y, z] 最终目标 (世界坐标)
-_ext_active = False      # 外部目标是否激活
-_ext_waypoints = None    # [[x,y,z], ...] 插值路径点
-_ext_wp_idx = -1         # 当前路径点索引 (-1=无)
-_ext_speed = 0.3         # 移动速度 [0.05, 1.0], 默认 0.3
-_ext_tcp = np.zeros(3)   # 当前 TCP 位置 (供查询用)
-_ext_error = 0.0         # 当前位置误差 (到当前路径点)
-_ext_final_error = 0.0   # 当前位置误差 (到最终目标, 供控制面板显示)
-_ext_reached = False     # 外部目标是否已完成 (正常到达或近似到达)
+
+# 外部控制共享状态 — 主循环与 mg400_server 通过同一对象通信
+from types import SimpleNamespace as _Ns
+ext = _Ns()
+ext.lock = threading.Lock()
+ext.target = None         # [x, y, z] 最终目标 (世界坐标)
+ext.active = False        # 外部目标是否激活
+ext.waypoints = None      # [[x,y,z], ...] 插值路径点
+ext.wp_idx = -1           # 当前路径点索引 (-1=无)
+ext.speed = 0.3           # 移动速度 [0.05, 1.0], 默认 0.3
+ext.tcp = np.zeros(3)     # 当前 TCP 位置 (供查询用)
+ext.error = 0.0           # 当前位置误差 (到当前路径点)
+ext.final_error = 0.0     # 当前位置误差 (到最终目标, 供控制面板显示)
+ext.reached = False       # 外部目标是否已完成
+ext.joint_move = False    # 是否关节模式运动
+ext.target_joints = None  # 目标关节角 rad [j1,j2,j3,j4]
+ext.obstacle_active = False  # 避障开关
+ext.obstacle_pos = np.zeros(3)  # 障碍物世界坐标 [x,y,z]
+ext.obstacle_radius = 0.025    # 障碍物圆柱半径 (m)
+ext.obstacle_half_length = 0.12 # 障碍物半长 (m), 沿局部X轴
+ext.last_replan_time = 0.0     # 上次重规划时间
 
 def _tcp_server():
-    """后台线程: 接收控制面板命令, 驱动机械臂到目标坐标"""
-    global Z_INITIAL, _HOME_TCP, _WS_Z_WORLD, _WS_R_MIN, _WS_R_MAX, _ext_target, _ext_active, _ext_waypoints, _ext_wp_idx, _ext_speed, _ext_tcp, _ext_error, _ext_final_error, _ext_reached
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("localhost", 9876))
-    server.listen(1)
-    server.settimeout(1.0)
-    print("  TCP server: localhost:9876 (等待控制面板连接...)")
-
-    conn = None
-    buf = ""
-    while True:
-        try:
-            if conn is None:
-                try:
-                    conn, addr = server.accept()
-                    print(f"  控制面板已连接: {addr}")
-                except socket.timeout:
-                    continue
-
-            data = conn.recv(4096)
-            if not data:
-                conn.close()
-                conn = None
-                print("  控制面板已断开")
-                continue
-
-            buf += data.decode("utf-8")
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    req = json.loads(line)
-                except json.JSONDecodeError:
-                    conn.sendall(json.dumps({"status": "error", "msg": "bad json"}).encode() + b"\n")
-                    continue
-
-                cmd = req.get("cmd", "")
-                try:
-                    if cmd == "move":
-                        x, y, z_rel = float(req["x"]), float(req["y"]), float(req["z"])
-                        speed = float(req.get("speed", 0.3))
-                        speed = max(0.05, min(1.0, speed))
-                        # J1 方位角校验: 基座固定在世界 45°, J1 范围 ±160°
-                        theta_world = np.degrees(np.arctan2(y, x))
-                        j1_needed = (theta_world - 45 + 180) % 360 - 180
-                        if abs(j1_needed) > 160:
-                            conn.sendall(json.dumps({"status": "error",
-                                "msg": f"方位角 θ={theta_world:.0f}° 超出J1范围 (基座45°, J1仅±160°): J1需转{j1_needed:.0f}°"}).encode() + b"\n")
-                            continue
-                        if Z_INITIAL is None:
-                            conn.sendall(json.dumps({"status": "error", "msg": "Z_INITIAL 未初始化"}).encode() + b"\n")
-                            continue
-                        world_z = Z_INITIAL + z_rel  # 相对Z → 世界Z
-                        with _ext_lock:
-                            _ext_speed = speed
-                            _ext_target = [x, y, world_z]
-                            cur = _ext_tcp.tolist()
-
-                            wp_list = _plan_safe_motion(cur, [x, y, world_z],
-                                                        verbose_prefix="")
-
-                            # 检查路径点是否经过不可达区域 (Z=-26mm相对, r<190mm)
-                            unreachable = False
-                            all_points = [cur] + wp_list
-                            for i, wp in enumerate(wp_list):
-                                if _in_unreachable_zone(wp, Z_INITIAL):
-                                    unreachable = True
-                                    print(f"  ✗ 不可达: 路径点{i} ["
-                                          f"{wp[0]*1000:.0f},{wp[1]*1000:.0f},"
-                                          f"{(wp[2]-Z_INITIAL)*1000:.0f}]mm(相对) 进入不可达区域")
-                                    break
-                                if _segment_crosses_unreachable(all_points[i], wp, Z_INITIAL):
-                                    unreachable = True
-                                    print(f"  ✗ 不可达: 路径段{i} 穿过不可达区域")
-                                    break
-
-                            if unreachable:
-                                _ext_waypoints = None
-                                _ext_wp_idx = -1
-                                _ext_active = False
-                                _ext_reached = False
-                                conn.sendall(json.dumps({"status": "error",
-                                    "msg": "不可达: 抬升→平移→下降路径经过 Z≈-26mm, r<190mm 不可达区域"}).encode() + b"\n")
-                                continue
-
-                            _ext_waypoints = wp_list if wp_list else None
-                            _ext_wp_idx = 0 if _ext_waypoints else -1
-                            _ext_active = True
-                            _ext_reached = False
-                            if wp_list:
-                                print(f"  抬升→平移→下降路径: 共{len(wp_list)}段")
-                            else:
-                                print(f"  已在目标位置 (Z相对={z_rel*1000:.0f}mm)")
-                        conn.sendall(json.dumps({"status": "ok", "speed": speed}).encode() + b"\n")
-
-                    elif cmd == "getpos":
-                        with _ext_lock:
-                            tcp_world = _ext_tcp.copy()
-                            tcp_rel = [tcp_world[0], tcp_world[1], tcp_world[2] - (Z_INITIAL or 0.0)]
-                            err = float(_ext_final_error)  # 到最终目标的误差
-                            reached = _ext_reached          # 仅靠标志位判断, 不用误差兜底
-                            wp_info = (_ext_wp_idx, len(_ext_waypoints) if _ext_waypoints else 0)
-                        z_init_val = Z_INITIAL or 0.0
-                        resp = {
-                            "tcp": [round(v, 6) for v in tcp_rel],
-                            "error": round(err, 6),
-                            "reached": reached,
-                            "wp": wp_info,
-                            "z_range_rel": [round(-z_init_val * 1000), round(420 - z_init_val * 1000)],
-                            "z_optimal_rel": round(200 - z_init_val * 1000),
-                        }
-                        # 附上工作空间边界 (控制面板验证用)
-                        if _WS_Z_WORLD is not None:
-                            resp["ws_z_rel"] = [round((z - z_init_val) * 1000) for z in _WS_Z_WORLD]
-                            resp["ws_r_min"] = [round(r * 1000) for r in _WS_R_MIN]
-                            resp["ws_r_max"] = [round(r * 1000) for r in _WS_R_MAX]
-                        conn.sendall(json.dumps(resp).encode() + b"\n")
-
-                    elif cmd == "speed":
-                        val = float(req.get("value", 0.3))
-                        val = max(0.05, min(1.0, val))
-                        with _ext_lock:
-                            _ext_speed = val
-                        conn.sendall(json.dumps({"status": "ok", "speed": val}).encode() + b"\n")
-
-                    elif cmd == "stop":
-                        with _ext_lock:
-                            _ext_active = False
-                            _ext_target = None
-                            _ext_waypoints = None
-                            _ext_wp_idx = -1
-                            _ext_reached = True
-                        conn.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
-
-                    elif cmd == "home":
-                        if _HOME_TCP is None:
-                            conn.sendall(json.dumps({"status": "error", "msg": "原点未初始化"}).encode() + b"\n")
-                            continue
-                        speed = float(req.get("speed", 0.3))
-                        speed = max(0.05, min(1.0, speed))
-                        home_world = _HOME_TCP.tolist()
-                        with _ext_lock:
-                            _ext_speed = speed
-                            _ext_target = home_world
-                            cur = _ext_tcp.tolist()
-                            wp_list = _plan_safe_motion(cur, home_world, verbose_prefix="回零 ")
-                            _ext_waypoints = wp_list if wp_list else None
-                            _ext_wp_idx = 0 if _ext_waypoints else -1
-                            _ext_active = True
-                            _ext_reached = False
-                            print(f"  回零路径: 共{len(wp_list)}段")
-                        conn.sendall(json.dumps({"status": "ok", "msg": "回零中"}).encode() + b"\n")
-
-                    else:
-                        conn.sendall(json.dumps({"status": "error", "msg": f"unknown cmd {cmd}"}).encode() + b"\n")
-
-                except (KeyError, ValueError, TypeError) as e:
-                    conn.sendall(json.dumps({"status": "error", "msg": str(e)}).encode() + b"\n")
-
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            if conn:
-                conn.close()
-                conn = None
-                print("  控制面板已断开")
+    """MG400 协议服务器已在 mg400_server.py 中, 此函数已移除。"""
 
 
 def main():
@@ -433,8 +351,53 @@ def main():
               f"range={model.jnt_range[i]}")
     print("-" * 55)
 
+    # ── 按键回调相关（必须在 launch_passive 之前定义, 作为参数传入）──
+    free_drag = [False]
+    show_workspace = [True]
+    selected_joint = [0]  # 0=J1, 1=J2, 2=J3, 3=J4
+    orig_gainprm = model.actuator_gainprm.copy()
+
+    def enter_drag_mode():
+        for i in range(model.nu):
+            model.actuator_gainprm[i, 0] = 0.0
+            model.actuator_gainprm[i, 1] = 0.0
+        print("\n  >>> 自由拖拽模式 (Ctrl+右键拖拽末端, IK 解算) <<<\n")
+
+    def enter_slider_mode():
+        model.actuator_gainprm[:] = orig_gainprm
+        print("\n  >>> 滑块控制模式 <<<\n")
+
+    def key_callback_ext(key):
+        """按键回调：Tab 切换模式 + 数字键选关节 + O 障碍物 + W 工作空间
+        MuJoCo 3.8 key_callback 签名为 Callable[[int], None], 仅在 PRESS 时触发。"""
+        if key == glfw.KEY_TAB:
+            free_drag[0] = not free_drag[0]
+            if free_drag[0]:
+                enter_drag_mode()
+            else:
+                enter_slider_mode()
+        if key == glfw.KEY_W:
+            show_workspace[0] = _toggle_workspace_vis(model)
+            print(f"  工作空间可视化: {'ON' if show_workspace[0] else 'OFF'}")
+        elif key == glfw.KEY_O:
+            ext.obstacle_active = not ext.obstacle_active
+            obs_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "obstacle_geom")
+            if ext.obstacle_active:
+                if obs_geom_id >= 0:
+                    model.geom_rgba[obs_geom_id] = [1.0, 0.2, 0.1, 0.55]
+                print(f"  障碍物避障: ON (O键切换, 方向键移动)")
+            else:
+                if obs_geom_id >= 0:
+                    model.geom_rgba[obs_geom_id] = [1.0, 0.2, 0.1, 0.0]
+                print(f"  障碍物避障: OFF")
+        for i, k in enumerate([glfw.KEY_1, glfw.KEY_2, glfw.KEY_3, glfw.KEY_4]):
+            if key == k:
+                selected_joint[0] = i
+                print(f"  选中关节: J{i+1}")
+
     with mujoco.viewer.launch_passive(
-        model, data, show_left_ui=True, show_right_ui=True
+        model, data, show_left_ui=True, show_right_ui=True,
+        key_callback=key_callback_ext,
     ) as viewer:
         if hasattr(viewer, 'cam'):
             viewer.cam.lookat[:] = [0.0, 0.0, 0.25]
@@ -470,8 +433,20 @@ def main():
             target_marker_mocap_id = model.body_mocapid[target_marker_body_id]
             print(f"  Target marker: body_id={target_marker_body_id}, mocap_id={target_marker_mocap_id}")
 
+        # 障碍物 mocap 初始化
+        obs_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "obstacle")
+        if obs_body_id >= 0:
+            obs_mocap_id = model.body_mocapid[obs_body_id]
+            # 默认位置: 工作空间中部偏左, 模拟操作员手臂
+            data.mocap_pos[obs_mocap_id] = [0.28, -0.08, 0.28]
+            ext.obstacle_pos[:] = data.mocap_pos[obs_mocap_id]
+            print(f"  障碍物: body_id={obs_body_id}, mocap_id={obs_mocap_id} (按O键激活)")
+        else:
+            obs_mocap_id = -1
+            print(f"  警告: obstacle body 未找到")
+
         # 初始化外部状态 + 捕获原点姿态
-        _ext_tcp[:] = data.site_xpos[tcp_site_id]
+        ext.tcp[:] = data.site_xpos[tcp_site_id]
         global Z_INITIAL, _HOME_TCP, _WS_Z_WORLD, _WS_R_MIN, _WS_R_MAX
         Z_INITIAL = float(data.site_xpos[tcp_site_id][2])
         _HOME_TCP = data.site_xpos[tcp_site_id].copy()  # 原点姿态 TCP 位置 (J1=J2=J3=J4=0时)
@@ -488,49 +463,21 @@ def main():
         except FileNotFoundError:
             print("  警告: 未找到 workspace_cage_boundary.npz, 控制面板验证不可用")
 
-        # 启动 TCP 服务线程
-        server_thread = threading.Thread(target=_tcp_server, daemon=True)
-        server_thread.start()
+        # ── 构建共享状态 (供 mg400_server Dashboard/Feedback 使用) ──
+        server_state = {
+            "model": model, "data": data, "tcp_site_id": tcp_site_id,
+            "ext": ext,
+            "Z_INITIAL": Z_INITIAL, "_HOME_TCP": _HOME_TCP,
+            "_plan_safe_motion": _plan_safe_motion,
+            "_compute_waypoints": _compute_waypoints,
+            "_in_unreachable_zone": _in_unreachable_zone,
+            "_segment_crosses_unreachable": _segment_crosses_unreachable,
+        }
 
-        # ── 自由拖拽模式 ──
-        free_drag = [False]
-        orig_gainprm = model.actuator_gainprm.copy()
+        # 启动 MG400 协议服务器 (Dashboard 29999 + Feedback 30004)
+        mg400_server.start_servers(server_state)
+
         grav_comp = np.zeros(model.nv)
-
-        def enter_drag_mode():
-            for i in range(model.nu):
-                model.actuator_gainprm[i, 0] = 0.0
-                model.actuator_gainprm[i, 1] = 0.0
-            print("\n  >>> 自由拖拽模式 (Ctrl+右键拖拽末端, IK 解算) <<<\n")
-
-        def enter_slider_mode():
-            model.actuator_gainprm[:] = orig_gainprm
-            print("\n  >>> 滑块控制模式 <<<\n")
-
-        # ── 工作空间可视化 (预生成 STL 网格, 零每帧开销) ──
-        show_workspace = [True]  # 默认显示
-
-        # ── 方向键控制的当前关节索引 ──
-        selected_joint = [0]  # 0=J1, 1=J2, 2=J3, 3=J4
-
-        def key_callback_ext(key, scancode, action, mods):
-            """按键回调：Tab 切换模式 + 数字键选关节"""
-            if key == glfw.KEY_TAB and action == glfw.PRESS:
-                free_drag[0] = not free_drag[0]
-                if free_drag[0]:
-                    enter_drag_mode()
-                else:
-                    enter_slider_mode()
-            if action == glfw.PRESS:
-                if key == glfw.KEY_W:
-                    show_workspace[0] = _toggle_workspace_vis(model)
-                    print(f"  工作空间可视化: {'ON' if show_workspace[0] else 'OFF'}")
-                for i, k in enumerate([glfw.KEY_1, glfw.KEY_2, glfw.KEY_3, glfw.KEY_4]):
-                    if key == k:
-                        selected_joint[0] = i
-                        print(f"  选中关节: J{i+1}")
-
-        viewer.key_callback = key_callback_ext
         enter_slider_mode()
 
         # ── 鼠标拖拽状态（Win32 轮询）──
@@ -548,11 +495,13 @@ def main():
 
         print("  Tab 键: 切换 滑块控制 / 自由拖拽")
         print("  W  键: 切换 工作空间包络线")
+        print("  O  键: 切换 障碍物避障 (操作员手臂仿真)")
+        print("  障碍物移动: ↑↓←→ 移动XY, PageUp/PageDown 移动Z")
         print("  拖拽操作: Ctrl+右键拖拽末端 (IK 逆运动学)")
-        print("  方向键: ↑↓ 微调关节 (需先按数字键1/2/3/4选关节)")
+        print("  方向键: ↑↓ 微调关节 (仅自由拖拽+障碍物关闭时)")
         print("-" * 55)
 
-        global _ext_active, _ext_target, _ext_waypoints, _ext_wp_idx, _ext_speed, _ext_error, _ext_final_error, _ext_reached
+        # ext is module-level, attributes accessed without global
         was_soft = free_drag[0]  # 初始软模式状态
         stall_frames = 0         # 路径点停滞计数 (帧)
         best_dist = 999.0        # 当前路径点最佳误差 (m)
@@ -561,11 +510,21 @@ def main():
         unreachable_cooldown = 0 # 不可到达提示冷却帧数
         stall_cycles = 0         # 连续停滞周期计数
         replan_count = 0         # 连续重算路径计数
+        # 障碍物键盘边沿检测: 仅在按键从 0→1 时触发 (每次 20mm)
+        _OBS_KEY_MAP = [
+            (0x26, ( 0,  1,  0)),  # ↑ → 世界+Y
+            (0x28, ( 0, -1,  0)),  # ↓ → 世界-Y
+            (0x25, (-1,  0,  0)),  # ← → 世界-X
+            (0x27, ( 1,  0,  0)),  # → → 世界+X
+            (0x21, ( 0,  0,  1)),  # PageUp → +Z
+            (0x22, ( 0,  0, -1)),  # PageDown → -Z
+        ]
+        _obs_key_prev = {vk: False for vk, _ in _OBS_KEY_MAP}
         while viewer.is_running():
             # ── 检测外部目标 ──
             ext_now = False
-            with _ext_lock:
-                ext_now = _ext_active
+            with ext.lock:
+                ext_now = ext.active
             soft_mode = free_drag[0] or ext_now
 
             # ── 软模式进入/退出时切换执行器增益 ──
@@ -581,6 +540,39 @@ def main():
                 model.actuator_gainprm[:] = orig_gainprm
 
             if soft_mode:
+
+                # ── 处理关节模式运动 (MovJ joint) → FK → TCP 路径 ──
+                if ext.joint_move and ext.target_joints is not None:
+                    with ext.lock:
+                        if ext.joint_move and ext.target_joints is not None:
+                            j_rad = ext.target_joints
+                            ext.joint_move = False
+                            ext.target_joints = None
+                            cur = ext.tcp.tolist()
+                            # FK: 临时设置关节角 → mj_forward → 读 TCP
+                            save = data.qpos.copy()
+                            data.qpos[0] = j_rad[0]
+                            data.qpos[1] = j_rad[1]
+                            data.qpos[2] = j_rad[2]
+                            data.qpos[5] = j_rad[3]
+                            data.qpos[3] = -j_rad[1]
+                            data.qpos[4] = -j_rad[2]
+                            data.qpos[6] = j_rad[1]
+                            data.qpos[7] = -j_rad[1]
+                            data.qpos[8] = j_rad[2]
+                            mujoco.mj_forward(model, data)
+                            tcp_world = data.site_xpos[tcp_site_id].copy()
+                            data.qpos[:] = save
+                            mujoco.mj_forward(model, data)
+                            # 规划安全路径
+                            wp_list = _plan_safe_motion(cur, tcp_world.tolist(),
+                                                        verbose_prefix="Joint→ ")
+                            ext.target = tcp_world.tolist()
+                            ext.waypoints = wp_list if wp_list else None
+                            ext.wp_idx = 0 if ext.waypoints else -1
+                            ext.active = True
+                            ext.reached = False
+                            print(f"  Joint→FK TCP: [{tcp_world[0]*1000:.0f},{tcp_world[1]*1000:.0f},{tcp_world[2]*1000:.0f}]mm, {len(wp_list)}段")
 
                 # ── 鼠标拖拽 (仅自由拖拽模式) ──
                 if free_drag[0]:
@@ -617,10 +609,10 @@ def main():
                 if free_drag[0] and drag["active"]:
                     ik_target = drag["target"]
                 elif ext_now:
-                    with _ext_lock:
-                        wp_list = _ext_waypoints
-                        wp_idx = _ext_wp_idx
-                        speed = _ext_speed
+                    with ext.lock:
+                        wp_list = ext.waypoints
+                        wp_idx = ext.wp_idx
+                        speed = ext.speed
                     if wp_list is not None and 0 <= wp_idx < len(wp_list):
                         ik_target = np.array(wp_list[wp_idx], dtype=float)
 
@@ -639,6 +631,49 @@ def main():
                         J[:, 0] = jac_buf[:, 0]                                                       # J1
                         J[:, 1] = jac_buf[:, 1] - jac_buf[:, 3] + jac_buf[:, 6] - jac_buf[:, 7]       # J2 + mimics
                         J[:, 2] = jac_buf[:, 2] - jac_buf[:, 4] + jac_buf[:, 8]                        # J3 + mimics
+
+                        # ── 障碍物排斥势场 ──
+                        obs_repulsion = np.zeros(3)
+                        obs_blocked = False
+                        if ext.obstacle_active:
+                            obs_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "obstacle")
+                            if obs_id >= 0:
+                                # 同步 mocap 位置 (ext.obstacle_pos 为权威源, 由 SetObstacle/键盘设置)
+                                obs_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "obstacle")
+                                if obs_body_id >= 0:
+                                    mocap_id = model.body_mocapid[obs_body_id]
+                                    data.mocap_pos[mocap_id] = ext.obstacle_pos.copy()
+                                # 读取实际 mocap 位置用于避障计算
+                                obs_pos = ext.obstacle_pos.copy()
+                                obs_repulsion, min_surf = _obstacle_repulsion(
+                                    tcp_pos, obs_pos, ext.obstacle_radius, ext.obstacle_half_length)
+                                # 检查所有剩余路径点是否被阻挡
+                                if ext.waypoints is not None and ext.wp_idx >= 0 and ext.wp_idx < len(ext.waypoints):
+                                    for ahead in range(ext.wp_idx, len(ext.waypoints)):
+                                        if _check_path_blocked(ext.waypoints[ahead], obs_pos, ext.obstacle_radius, ext.obstacle_half_length):
+                                            obs_blocked = True
+                                            break
+                            # 障碍物可视化: 靠近时变红
+                            geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "obstacle_geom")
+                            if geom_id >= 0:
+                                danger = 1.0 - min(min_surf / 0.060, 1.0)
+                                model.geom_rgba[geom_id] = [1.0, 0.2 * (1 - danger), 0.1 * (1 - danger),
+                                                            0.55 + danger * 0.45]
+                            # 路径点被阻挡 → 触发重规划 (检查当前路径是否被阻挡)
+                            now = data.time
+                            if obs_blocked and ext.active and ext.waypoints is not None \
+                                    and now - ext.last_replan_time > 0.8:
+                                ext.last_replan_time = now
+                                # 向上绕行: 在障碍物上方插入中间点
+                                mid_z = ext.obstacle_pos[2] + 0.12
+                                detour = [ext.waypoints[ext.wp_idx - 1][0] if ext.wp_idx > 0 else tcp_pos[0],
+                                          ext.waypoints[ext.wp_idx - 1][1] if ext.wp_idx > 0 else tcp_pos[1],
+                                          mid_z]
+                                new_segs = _plan_safe_motion(tcp_pos.tolist(), detour, verbose_prefix="避障绕行")
+                                remaining = _plan_safe_motion(detour, ext.target.tolist() if hasattr(ext.target, 'tolist') else ext.target)
+                                ext.waypoints = new_segs + remaining
+                                ext.wp_idx = 0
+                                print(f"  ⚠ 路径点被障碍阻挡 → 绕行 (抬升至 {mid_z*1000:.0f}mm)")
 
                         # 关节限位感知: 处于限位且无法继续同向运动的关节从IK中排除
                         # _grad = error·J_col: _grad>0 → dq应为正; _grad<0 → dq应为负
@@ -681,14 +716,16 @@ def main():
                             J[:, 1] = jac_buf[:, 1] - jac_buf[:, 3] + jac_buf[:, 6] - jac_buf[:, 7]
                             J[:, 2] = jac_buf[:, 2] - jac_buf[:, 4] + jac_buf[:, 8]
 
-                        lam = 0.005 + speed * 0.015  # 低速用更小阻尼, 避免欠驱动
+                        lam = 0.001 + speed * 0.008 if dist < 0.020 else 0.005 + speed * 0.015
                         A = J @ J.T + lam * np.eye(3)
 
-                        max_step = 0.005 + speed * 0.025  # 最低5mm/帧, 保证低速仍能前进
-                        if dist > max_step * 2:
+                        max_step = 0.005 + speed * 0.025
+                        if dist < 0.005:
+                            error = error  # 最终逼近: 不做步长截断
+                        elif dist > max_step * 2:
                             error = error / dist * max_step
 
-                        dq = J.T @ np.linalg.solve(A, error) + repulsion
+                        dq = J.T @ np.linalg.solve(A, error + obs_repulsion) + repulsion
 
                         # J1 方向校正: 局部梯度可能指向"短路径"(撞限位),
                         # 而全局正确路径需要J1反向旋转(经过0°到目标方位)
@@ -728,16 +765,16 @@ def main():
                         else:
                             stall_frames += 1
 
-                        with _ext_lock:
-                            _ext_tcp[:] = tcp_pos
-                            _ext_error = dist
+                        with ext.lock:
+                            ext.tcp[:] = tcp_pos
+                            ext.error = dist
                             # 计算到最终目标的误差 (供控制面板实时显示)
-                            if _ext_target is not None:
-                                _ext_final_error = float(np.linalg.norm(tcp_pos - _ext_target))
+                            if ext.target is not None:
+                                ext.final_error = float(np.linalg.norm(tcp_pos - ext.target))
                             else:
-                                _ext_final_error = 0.0
-                            wp_list = _ext_waypoints
-                            wp_idx = _ext_wp_idx
+                                ext.final_error = 0.0
+                            wp_list = ext.waypoints
+                            wp_idx = ext.wp_idx
 
                             # 路径点变更时重置停滞计数
                             if wp_list is not current_wp_list or wp_idx != current_wp_idx:
@@ -763,46 +800,46 @@ def main():
                                     next_wp = np.array(wp_list[wp_idx + 1])
                                     dist_to_next = np.linalg.norm(tcp_pos - next_wp)
                                     if dist_to_next < dist:
-                                        _ext_wp_idx = wp_idx + 1
-                                        _ext_error = dist_to_next
+                                        ext.wp_idx = wp_idx + 1
+                                        ext.error = dist_to_next
                                         stall_frames = 0; best_dist = 999.0
-                                        current_wp_idx = _ext_wp_idx
+                                        current_wp_idx = ext.wp_idx
                                         continue  # 跳过其余条件, 下帧再判
 
                                 # ① 到达阈值推进 (备用): 误差 < 自适应阈值时推进
                                 if dist < arrive_tol and wp_idx < len(wp_list) - 1:
-                                    _ext_wp_idx = wp_idx + 1
+                                    ext.wp_idx = wp_idx + 1
                                     stall_frames = 0; best_dist = 999.0
-                                    current_wp_idx = _ext_wp_idx
+                                    current_wp_idx = ext.wp_idx
                                     if wp_idx % 10 == 0:
-                                        print(f"  路径点 {_ext_wp_idx}/{len(wp_list)}, err={dist*1000:.1f}mm")
+                                        print(f"  路径点 {ext.wp_idx}/{len(wp_list)}, err={dist*1000:.1f}mm")
                                 elif dist < arrive_tol:
                                     # ② 到达最终路径点 → 目标完成
-                                    _ext_active = False
-                                    _ext_target = None
-                                    _ext_waypoints = None
-                                    _ext_wp_idx = -1
-                                    _ext_reached = True
-                                    _ext_error = dist
+                                    ext.active = False
+                                    ext.target = None
+                                    ext.waypoints = None
+                                    ext.wp_idx = -1
+                                    ext.reached = True
+                                    ext.error = dist
                                     print(f"  目标到达: TCP={tcp_pos}, err={dist*1000:.1f}mm")
                                     stall_frames = 0; best_dist = 999.0
 
                                 # ④ 停滞 > 1.5s (≈45帧) 且未到达: 强制推进
                                 if stall_frames > 45 and dist >= arrive_tol:
                                     if wp_idx < len(wp_list) - 1:
-                                        _ext_wp_idx = wp_idx + 1
+                                        ext.wp_idx = wp_idx + 1
                                         stall_frames = 0; best_dist = 999.0
-                                        current_wp_idx = _ext_wp_idx
-                                        print(f"  停滞 → 强制路径点 {_ext_wp_idx}/{len(wp_list)} (err={dist*1000:.0f}mm)")
+                                        current_wp_idx = ext.wp_idx
+                                        print(f"  停滞 → 强制路径点 {ext.wp_idx}/{len(wp_list)} (err={dist*1000:.0f}mm)")
                                     else:
-                                        if dist < 0.050:
-                                            _ext_active = False
-                                            _ext_target = None
-                                            _ext_waypoints = None
-                                            _ext_wp_idx = -1
-                                            _ext_reached = True
-                                            _ext_error = dist
-                                            print(f"  目标近似到达 (停滞, err={dist*1000:.0f}mm)")
+                                        if dist < 0.005:
+                                            ext.active = False
+                                            ext.target = None
+                                            ext.waypoints = None
+                                            ext.wp_idx = -1
+                                            ext.reached = True
+                                            ext.error = dist
+                                            print(f"  目标近似到达 (停滞, err={dist*1000:.1f}mm)")
                                             stall_frames = 0; best_dist = 999.0
                                             stall_cycles = 0
                                         else:
@@ -811,7 +848,7 @@ def main():
                                                 # 诊断: 打印当前关节角度和限位状态
                                                 print(f"  ┌─ 停滞诊断 ─────────────────────────────")
                                                 print(f"  │ TCP位置: [{tcp_pos[0]:.4f} {tcp_pos[1]:.4f} {tcp_pos[2]:.4f}]")
-                                                print(f"  │ 目标: {_ext_target}")
+                                                print(f"  │ 目标: {ext.target}")
                                                 for _qi in IK_JOINTS:
                                                     _lo, _hi = model.jnt_range[_qi]
                                                     _at_lo = data.qpos[_qi] <= _lo + 0.003
@@ -822,31 +859,31 @@ def main():
                                             if stall_cycles >= 2:
                                                 replan_count += 1
                                                 if replan_count >= 2:
-                                                    _ext_active = False
-                                                    _ext_target = None
-                                                    _ext_waypoints = None
-                                                    _ext_wp_idx = -1
-                                                    _ext_error = dist
+                                                    ext.active = False
+                                                    ext.target = None
+                                                    ext.waypoints = None
+                                                    ext.wp_idx = -1
+                                                    ext.error = dist
                                                     print(f"  目标不可达 (err={dist*1000:.0f}mm, {replan_count}次重算后放弃)")
                                                     stall_frames = 0; best_dist = 999.0
                                                     stall_cycles = 0
                                                     replan_count = 0
                                                 else:
-                                                    new_wps = _compute_waypoints(tcp_pos.tolist(), _ext_target)
+                                                    new_wps = _compute_waypoints(tcp_pos.tolist(), ext.target)
                                                     if new_wps:
-                                                        _ext_waypoints = new_wps
-                                                        _ext_wp_idx = 0
+                                                        ext.waypoints = new_wps
+                                                        ext.wp_idx = 0
                                                         stall_frames = 0; best_dist = 999.0
                                                         stall_cycles = 0
                                                         current_wp_list = new_wps
                                                         current_wp_idx = 0
                                                         print(f"  重算路径 [{replan_count}/2]: 从当前位置到目标, {len(new_wps)}段")
                                                     else:
-                                                        _ext_active = False
-                                                        _ext_target = None
-                                                        _ext_waypoints = None
-                                                        _ext_wp_idx = -1
-                                                        _ext_error = dist
+                                                        ext.active = False
+                                                        ext.target = None
+                                                        ext.waypoints = None
+                                                        ext.wp_idx = -1
+                                                        ext.error = dist
                                                         print(f"  目标不可达 (err={dist*1000:.0f}mm, 重算失败)")
                                                         stall_frames = 0; best_dist = 999.0
                                                         stall_cycles = 0
@@ -860,8 +897,8 @@ def main():
                                                 stall_frames = 0
                                                 best_dist = dist
 
-                # ── 方向键 (仅自由拖拽模式) ──
-                if free_drag[0]:
+                # ── 方向键 (仅自由拖拽模式, 且障碍物未激活) ──
+                if free_drag[0] and not ext.obstacle_active:
                     step = 0.03
                     sj = selected_joint[0]
                     updated = False
@@ -894,10 +931,26 @@ def main():
                 data.qacc[:] = qacc_save
                 data.qfrc_applied[:] = grav_comp - 0.2 * data.qvel  # 降低速度阻尼, 减小伺服静差
 
+            # ── 障碍物移动 + mocap 同步 (边沿触发, 每次按键移动 20mm) ──
+            if ext.obstacle_active:
+                obs_step = 0.020  # 20mm/次
+                with ext.lock:
+                    # 边沿检测: 只在按下瞬间 (0→1) 触发一次
+                    for vk, delta in _OBS_KEY_MAP:
+                        pressed = bool(_user32.GetAsyncKeyState(vk) & 0x8000)
+                        if pressed and not _obs_key_prev[vk]:
+                            ext.obstacle_pos[0] += delta[0] * obs_step
+                            ext.obstacle_pos[1] += delta[1] * obs_step
+                            ext.obstacle_pos[2] += delta[2] * obs_step
+                        _obs_key_prev[vk] = pressed
+                # 同步 mocap 位置以更新渲染
+                if obs_mocap_id >= 0:
+                    data.mocap_pos[obs_mocap_id] = ext.obstacle_pos.copy()
+
             # ── 每帧更新 TCP 位置 (供外部查询) ──
-            with _ext_lock:
-                _ext_tcp[:] = data.site_xpos[tcp_site_id]
-                cur_target = _ext_target if _ext_active else None
+            with ext.lock:
+                ext.tcp[:] = data.site_xpos[tcp_site_id]
+                cur_target = ext.target if ext.active else None
 
             # ── 更新目标点标记 (mocap) ──
             if target_marker_mocap_id >= 0 and cur_target is not None:

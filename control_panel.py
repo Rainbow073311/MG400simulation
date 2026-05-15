@@ -1,14 +1,14 @@
 """
 MG400 控制面板 — 独立运行的图形化交互脚本
-与 MuJoCo 仿真中的 TCP 服务器 (simulate_slider.py) 通信,
-发送目标坐标, 驱动机械臂通过 IK 到达指定位置。
+使用 Dobot Dashboard 协议 (端口 29999) 与仿真/真实 MG400 通信。
 
 用法:
     python control_panel.py
-    python control_panel.py --host localhost --port 9876
+    python control_panel.py --host localhost --port 29999
 """
 import argparse
 import json
+import re
 import socket
 import sys
 import threading
@@ -19,15 +19,16 @@ import numpy as np
 
 
 class MG400ControlPanel:
-    """控制面板: TCP 客户端 + tkinter GUI"""
+    """控制面板: Dobot Dashboard 协议客户端 + tkinter GUI"""
 
-    def __init__(self, host="localhost", port=9876, ext_port=9878):
+    def __init__(self, host="localhost", port=29999, ext_port=9878):
         self.host = host
         self.port = port
         self.ext_port = ext_port
         self.sock = None
         self._reconnect_cooldown = 0
         self._speed_after_id = None
+        self._z_initial_mm = 120.0   # TCP Z 基准 (mm, 基座坐标), 首次 GetPose 后更新
         self._ext_auto_send = True  # 外部输入是否自动发送
         self._ext_server_sock = None
 
@@ -98,18 +99,9 @@ class MG400ControlPanel:
         self.reached_label.pack(side="right")
 
         # ── 目标输入 ──
-        target_frame = ttk.LabelFrame(self.window, text="目标坐标 (X/Y世界, Z相对初始位置, 毫米)", padding=10)
+        target_frame = ttk.LabelFrame(self.window, text="目标坐标 (Dobot 基座坐标, X/Y绝对 Z相对, 毫米)", padding=10)
         target_frame.pack(fill="x", padx=12, pady=8)
 
-        # 工作范围 — 由仿真服务器动态提供 (相对 Z 坐标系)
-        self.Z_RANGE = (-200, 230)
-        self.Z_OPTIMAL = 10
-        self.MAX_RADIUS = 440
-        self.R_Z_SLOPE = 0.35
-        # 精细边界数据 (从 getpos 获取)
-        self.ws_z_rel = None    # Z 数组 (相对, mm)
-        self.ws_r_min = None    # R_min 数组 (mm)
-        self.ws_r_max = None    # R_max 数组 (mm)
 
         def make_input(parent, label, initial):
             row = ttk.Frame(parent)
@@ -118,7 +110,7 @@ class MG400ControlPanel:
             var = tk.StringVar(value=initial)
             entry = ttk.Entry(row, textvariable=var, width=12)
             entry.pack(side="left")
-            hint = {"X:": "mm 世界坐标", "Y:": "mm 世界坐标", "Z:": "mm 相对初始位置"}.get(label, "")
+            hint = {"X:": "mm 基座坐标", "Y:": "mm 基座坐标", "Z:": "mm 相对TCP原点"}.get(label, "")
             ttk.Label(row, text=hint, width=16, foreground="gray").pack(side="left")
             return var, entry
 
@@ -168,6 +160,19 @@ class MG400ControlPanel:
             home_frame, text="⟲ 回零 (安全姿态)", command=self._go_home
         ).pack(fill="x")
 
+        # ── 障碍物避障 ──
+        obs_frame = ttk.LabelFrame(self.window, text="障碍物避障 (操作员手臂)", padding=8)
+        obs_frame.pack(fill="x", padx=12, pady=(0, 4))
+        obs_row = ttk.Frame(obs_frame)
+        obs_row.pack(fill="x")
+        self.obs_btn = ttk.Button(obs_row, text="● 激活障碍物", command=self._toggle_obstacle)
+        self.obs_btn.pack(side="left", padx=(0, 8))
+        self.obs_status_label = ttk.Label(obs_row, text="已关闭", foreground="gray")
+        self.obs_status_label.pack(side="left")
+        self.obs_pos_label = ttk.Label(obs_row, text="")
+        self.obs_pos_label.pack(side="right")
+        self._obs_active = False
+
         # ── 日志 ──
         log_frame = ttk.LabelFrame(self.window, text="日志", padding=5)
         log_frame.pack(fill="both", expand=True, padx=12, pady=8)
@@ -183,39 +188,69 @@ class MG400ControlPanel:
         # ── 外部接口 (大模型坐标输入) ──
         self._start_ext_server()
 
-    # ── 网络通信 ──
+    # ── 网络通信 (Dobot Dashboard 协议) ──
 
-    def _send_cmd(self, cmd_dict):
-        """发送 JSON 命令, 返回响应字典。连接失败返回 None。"""
+    def _send_cmd(self, text_cmd):
+        """发送文本命令 (Dashboard 协议), 返回响应字符串。连接失败返回 None。"""
         if self.sock is None:
             return None
         try:
-            msg = json.dumps(cmd_dict) + "\n"
-            self.sock.sendall(msg.encode("utf-8"))
+            msg = (text_cmd + "\n").encode("utf-8")
+            self.sock.sendall(msg)
             resp = self.sock.recv(4096)
             if not resp:
                 self._disconnect()
                 return None
-            return json.loads(resp.decode("utf-8"))
-        except (ConnectionResetError, BrokenPipeError, OSError, socket.timeout,
-                json.JSONDecodeError) as e:
+            return resp.decode("utf-8").strip()
+        except (ConnectionResetError, BrokenPipeError, OSError, socket.timeout):
             self._disconnect()
             return None
 
+    def _parse_pose_resp(self, resp):
+        """解析 GetPose 响应 '{x,y,z,rx,ry,rz}' → [x,y,z,rx,ry,rz] (float)."""
+        if resp is None:
+            return None
+        try:
+            m = re.match(r'\{([-0-9.,eE]+)\}', resp)
+            if m:
+                return [float(v.strip()) for v in m.group(1).split(',')]
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    def _send_dashboard_cmd(self, text_cmd):
+        """发送 Dashboard 命令, 检查响应是否为成功 (不以 -1 开头)。"""
+        resp = self._send_cmd(text_cmd)
+        if resp is None:
+            return False, None
+        # 成功响应: "0", "0,{id}", "{...}" (查询)
+        if resp.startswith("-1") and not resp.startswith("-1."):
+            return False, resp
+        return True, resp
+
     def _connect(self):
-        """连接仿真服务器"""
+        """连接仿真/真实 MG400 机器人 (Dashboard 端口)"""
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(2.0)
             self.sock.connect((self.host, self.port))
             self.sock.settimeout(0.5)
+            # 使能机器人
+            self._send_cmd("EnableRobot()")
+            # 获取当前位姿, 确定 Z_INITIAL
+            resp = self._send_cmd("GetPose()")
+            pose = self._parse_pose_resp(resp)
+            if pose and len(pose) >= 3:
+                self._z_initial_mm = pose[2]  # 基座坐标 Z (mm)
+                self._log(f"当前 TCP Z 基准: {self._z_initial_mm:.0f}mm")
+            # 同步速度
+            pct = int(float(self.speed_var.get()) * 100)
+            self._send_cmd(f"SpeedFactor({pct})")
             self.conn_label.config(text="● 已连接", foreground="green")
             self.move_btn.config(state="normal")
             self.stop_btn.config(state="normal")
             self._log(f"已连接到 {self.host}:{self.port}")
             self.validation_label.config(text="✓ 已连接, 可输入坐标", fg="green")
-            # 同步当前速度设置
-            self._send_cmd({"cmd": "speed", "value": self.speed_var.get()})
         except (ConnectionRefusedError, socket.timeout, OSError) as e:
             self.conn_label.config(text="未连接 (仿真未启动?)", foreground="red")
             self.sock = None
@@ -250,43 +285,10 @@ class MG400ControlPanel:
     # ── 命令 ──
 
     def _check_workspace(self, x_mm, y_mm, z_mm):
-        """使用精细边界数据验证坐标是否在工作空间内。返回 (ok, msg)。"""
-        r = (x_mm**2 + y_mm**2)**0.5
-
-        # J1 方位角校验: 基座固定在世界坐标系 45°, J1 范围 ±160°
-        # 可达世界方位角 = [45°-160°, 45°+160°] = [-115°, 205°]
-        theta_world = np.degrees(np.arctan2(y_mm, x_mm))
-        j1_needed = (theta_world - 45 + 180) % 360 - 180  # 归一化到 [-180, 180]
-        if abs(j1_needed) > 160:
-            return False, (f"方位角 θ={theta_world:.0f}° 超出J1范围 "
-                           f"(基座45°, J1仅±160°): J1需转{j1_needed:.0f}°")
-
-        # 有精细边界数据 → 精确验证
-        if self.ws_z_rel is not None and len(self.ws_z_rel) > 2:
-            z_arr = np.array(self.ws_z_rel, dtype=float)
-            r_min_arr = np.array(self.ws_r_min, dtype=float)
-            r_max_arr = np.array(self.ws_r_max, dtype=float)
-
-            if z_mm < z_arr[0] or z_mm > z_arr[-1]:
-                return False, f"Z={z_mm:.0f}mm 超出范围 ({z_arr[0]:.0f} ~ {z_arr[-1]:.0f})"
-
-            r_min_z = np.interp(z_mm, z_arr, r_min_arr)
-            r_max_z = np.interp(z_mm, z_arr, r_max_arr)
-
-            if r < r_min_z:
-                return False, f"r={r:.0f}mm < R_min={r_min_z:.0f}mm (Z={z_mm:.0f}mm 处太靠近基座)"
-            if r > r_max_z:
-                return False, f"r={r:.0f}mm > R_max={r_max_z:.0f}mm (Z={z_mm:.0f}mm 处超出最大工作半径)"
-            return True, ""
-
-        # 无精细数据 → 用简化公式
-        if r > self.MAX_RADIUS:
-            return False, f"r={r:.0f} > {self.MAX_RADIUS} mm"
-        r_max_z = max(50, self.MAX_RADIUS - self.R_Z_SLOPE * abs(z_mm - self.Z_OPTIMAL))
-        if r > r_max_z:
-            return False, f"Z={z_mm:.0f}mm 处最大可到 r={r_max_z:.0f}mm, 当前 r={r:.0f}mm"
-        if not (self.Z_RANGE[0] <= z_mm <= self.Z_RANGE[1]):
-            return False, f"Z={z_mm:.0f} 超出范围 ({self.Z_RANGE[0]} ~ {self.Z_RANGE[1]})"
+        """J1 方位角验证 (Dobot 基座坐标, 方位角 = J1 角度, ±160°)。"""
+        theta_base = np.degrees(np.arctan2(y_mm, x_mm))
+        if abs(theta_base) > 160:
+            return False, f"方位角 θ={theta_base:.0f}° 超出J1范围 (±160°)"
         return True, ""
 
     def _clear_validation(self):
@@ -294,23 +296,22 @@ class MG400ControlPanel:
         self.validation_label.config(text="", fg="red")
 
     def _send_target(self):
-        """发送目标坐标 (先验证, 再发送)"""
+        """发送目标坐标 (Dobot 基座坐标 mm, MovJ pose)"""
         if self.sock is None:
             self._log("错误: 未连接到仿真")
             self.validation_label.config(text="⚠ 未连接到仿真, 请先点击「连接」", fg="red")
             return
         try:
-            x = float(self.x_var.get()) / 1000.0
-            y = float(self.y_var.get()) / 1000.0
-            z = float(self.z_var.get()) / 1000.0
+            x_mm = float(self.x_var.get())
+            y_mm = float(self.y_var.get())
+            z_rel = float(self.z_var.get())
         except ValueError:
             self._log("错误: 坐标值必须是数字")
             self.validation_label.config(text="⚠ 坐标值必须是数字", fg="red")
             return
 
-        x_mm = x * 1000
-        y_mm = y * 1000
-        z_mm = z * 1000
+        # Z 基准: 用户输入的是相对 Z, 转绝对坐标
+        z_mm = self._z_initial_mm + z_rel
 
         # 工作空间验证
         ok, msg = self._check_workspace(x_mm, y_mm, z_mm)
@@ -321,18 +322,19 @@ class MG400ControlPanel:
 
         self._log(f"✓ 坐标在工作范围内, 发送目标...")
         self.validation_label.config(text="✓ 坐标有效, 正在发送...", fg="green")
-        resp = self._send_cmd({"cmd": "move", "x": x, "y": y, "z": z, "speed": float(self.speed_var.get())})
+
+        cmd = f"MovJ(pose={{{x_mm:.1f},{y_mm:.1f},{z_mm:.1f},0,0,0}})"
+        ok, resp = self._send_dashboard_cmd(cmd)
         if resp is None:
             self._log("错误: 发送失败, 请重新连接")
             self.validation_label.config(text="⚠ 发送失败, 请重新连接", fg="red")
             return
-        if resp.get("status") == "ok":
-            self._log(f"目标已发送: X={x:.4f}  Y={y:.4f}  Z={z:.4f} (相对)")
-            self.validation_label.config(text=f"✓ 目标已发送 X={x_mm:.0f} Y={y_mm:.0f} Z={z_mm:.0f}mm", fg="green")
+        if ok:
+            self._log(f"目标已发送: X={x_mm:.0f} Y={y_mm:.0f} Z={z_mm:.0f}mm")
+            self.validation_label.config(text=f"✓ 目标已发送 X={x_mm:.0f} Y={y_mm:.0f} Z={z_rel:.0f}mm(相对)", fg="green")
         else:
-            err_msg = resp.get('msg', '未知错误')
-            self._log(f"错误: {err_msg}")
-            self.validation_label.config(text=f"⚠ 服务器拒绝 — {err_msg}", fg="red")
+            self._log(f"错误: {resp}")
+            self.validation_label.config(text=f"⚠ 服务器拒绝 — {resp}", fg="red")
 
     def _on_speed_change(self, val):
         """速度滑块变化时发送到仿真 (防抖: 停止拖动150ms后才发送)"""
@@ -341,29 +343,48 @@ class MG400ControlPanel:
         if self._speed_after_id is not None:
             self.window.after_cancel(self._speed_after_id)
         self._speed_after_id = self.window.after(
-            150, lambda: self._send_cmd({"cmd": "speed", "value": self.speed_var.get()}))
+            150, lambda: self._send_cmd(f"SpeedFactor({int(self.speed_var.get() * 100)})"))
 
     def _stop(self):
         """停止当前运动"""
-        resp = self._send_cmd({"cmd": "stop"})
-        if resp and resp.get("status") == "ok":
+        resp = self._send_cmd("Stop()")
+        if resp:
             self._log("已发送停止命令")
 
     def _go_home(self):
-        """回零 — 返回安全原点姿态 (J1=J2=J3=J4=0)"""
+        """回零 — 发送 MovJ joint 全零 → 仿真计算 FK 后规划安全路径"""
         if self.sock is None:
             self._log("错误: 未连接到仿真")
             self.validation_label.config(text="⚠ 未连接到仿真", fg="red")
             return
-        resp = self._send_cmd({"cmd": "home", "speed": float(self.speed_var.get())})
+        ok, resp = self._send_dashboard_cmd("MovJ(joint={0,0,0,0,0,0})")
         if resp is None:
             self._log("错误: 发送失败, 请重新连接")
             self.validation_label.config(text="⚠ 发送失败", fg="red")
-        elif resp.get("status") == "ok":
+        elif ok:
             self._log("已发送回零命令 — 抬升→平移→下降至原点")
             self.validation_label.config(text="⟲ 回零中...", fg="green")
         else:
-            self._log(f"错误: {resp.get('msg', '未知')}")
+            self._log(f"错误: {resp}")
+
+    def _toggle_obstacle(self):
+        """切换障碍物避障开关 (发送 SetObstacle 到 Dashboard)。"""
+        self._obs_active = not self._obs_active
+        active_int = 1 if self._obs_active else 0
+        pos = [0.25, -0.05, 0.28]  # 默认世界坐标位置
+        cmd = f"SetObstacle(active={active_int},pos={{{pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}}})"
+        ok, resp = self._send_dashboard_cmd(cmd)
+        if ok:
+            state = "已激活" if self._obs_active else "已关闭"
+            self.obs_btn.config(text="○ 关闭障碍物" if self._obs_active else "● 激活障碍物")
+            self.obs_status_label.config(text=state,
+                                         foreground="red" if self._obs_active else "gray")
+            self.obs_pos_label.config(text=f"位置: ({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})m")
+            self._log(f"障碍物避障: {state} (世界坐标 {pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f}m)")
+        else:
+            self._obs_active = not self._obs_active  # 恢复
+            self._log(f"障碍物切换失败: {resp}")
+            self._log(f"错误: {resp}")
 
     # ── 外部接口 (大模型坐标输入) ──
 
@@ -404,6 +425,25 @@ class MG400ControlPanel:
                     continue
 
                 req = json.loads(data.decode("utf-8"))
+                cmd = req.get("command", "move")  # "move" 或 "obstacle"
+
+                if cmd == "obstacle":
+                    # 转发障碍物控制命令到 Dashboard
+                    active = req.get("active", None)
+                    pos = req.get("pos", None)
+                    dash_cmd = "SetObstacle("
+                    parts = []
+                    if active is not None:
+                        parts.append(f"active={int(active)}")
+                    if pos is not None and len(pos) >= 3:
+                        parts.append(f"pos={{{pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}}}")
+                    dash_cmd += ",".join(parts) + ")"
+                    resp = self._send_cmd(dash_cmd)
+                    conn.sendall(json.dumps({"status": "ok", "resp": resp}).encode() + b"\n")
+                    conn.close()
+                    continue
+
+                # 默认: 坐标移动
                 x_mm = float(req["x"])
                 y_mm = float(req["y"])
                 z_mm = float(req["z"])
@@ -438,29 +478,21 @@ class MG400ControlPanel:
     def _poll_position(self):
         """定时查询 TCP 位置 (每 200ms), 断线时自动重连。"""
         if self.sock is not None:
-            resp = self._send_cmd({"cmd": "getpos"})
-            if resp is not None and "tcp" in resp:
-                tcp = resp["tcp"]
-                err = resp["error"]
-                reached = resp["reached"]
-                self.x_pos_label.config(text=f"{tcp[0]*1000:.1f}")
-                self.y_pos_label.config(text=f"{tcp[1]*1000:.1f}")
-                self.z_pos_label.config(text=f"{tcp[2]*1000:.1f}")
-                self.error_label.config(text=f"误差: {err*1000:.0f} mm")
-                if reached:
-                    self.reached_label.config(text="✓ 已到达", foreground="green")
-                else:
+            resp = self._send_cmd("GetPose()")
+            pose = self._parse_pose_resp(resp)
+            if pose and len(pose) >= 3:
+                self.x_pos_label.config(text=f"{pose[0]:.1f}")
+                self.y_pos_label.config(text=f"{pose[1]:.1f}")
+                self.z_pos_label.config(text=f"{pose[2] - self._z_initial_mm:.1f}")
+                self.error_label.config(text=f"TCP(基座): {pose[0]:.0f},{pose[1]:.0f},{pose[2]:.0f}mm")
+                # 检查 RobotMode
+                mode_resp = self._send_cmd("RobotMode()")
+                if mode_resp and mode_resp.strip() == "7":
                     self.reached_label.config(text="● 运动中", foreground="orange")
-                if "z_range_rel" in resp:
-                    self.Z_RANGE = (resp["z_range_rel"][0], resp["z_range_rel"][1])
-                if "z_optimal_rel" in resp:
-                    self.Z_OPTIMAL = resp["z_optimal_rel"]
-                if "ws_z_rel" in resp:
-                    self.ws_z_rel = resp["ws_z_rel"]
-                    self.ws_r_min = resp["ws_r_min"]
-                    self.ws_r_max = resp["ws_r_max"]
-            else:
-                pass  # _send_cmd 内部已调用 _disconnect
+                else:
+                    self.reached_label.config(text="✓ 就绪", foreground="green")
+            elif resp is not None:
+                pass  # 格式不对, 忽略
         else:
             # 断线自动重连 (每 2 秒尝试一次)
             if self._reconnect_cooldown <= 0:
@@ -486,7 +518,7 @@ class MG400ControlPanel:
 def main():
     parser = argparse.ArgumentParser(description="MG400 控制面板")
     parser.add_argument("--host", default="localhost", help="仿真服务器地址")
-    parser.add_argument("--port", type=int, default=9876, help="仿真服务器端口")
+    parser.add_argument("--port", type=int, default=29999, help="Dashboard 端口 (29999)")
     parser.add_argument("--ext-port", type=int, default=9878,
                         help="外部接口端口 (大模型坐标输入, 0=禁用)")
     args = parser.parse_args()

@@ -68,6 +68,13 @@
       <geom name="target_dot" type="sphere" size="0.008" rgba="1 0.35 0.1 0.9" contype="0" conaffinity="0"/>
     </body>
 
+    <!-- 障碍物 (操作员手臂) — 水平横放, mocap 可拖动, 默认隐藏 -->
+    <body name="obstacle" mocap="true" pos="0.28 -0.08 0.28">
+      <geom name="obstacle_geom" type="cylinder" size="0.025"
+            fromto="-0.12 0 0  0.12 0 0"
+            rgba="1 0.2 0.1 0.0" contype="1" conaffinity="1"/>
+      <site name="obstacle_center" pos="0 0 0" size="0.005" type="sphere" rgba="1 0 0 0"/>
+    </body>
 
     <!-- Frame0: 世界中心, 细长坐标轴 -->
     <body name="frame0" pos="0 0 0.002" mocap="true">
