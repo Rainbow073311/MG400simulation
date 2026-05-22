@@ -443,6 +443,40 @@ class MG400ControlPanel:
                     conn.close()
                     continue
 
+                # ── 查询类命令 (转发到 Dashboard) ──
+                QUERY_MAP = {
+                    "get_obstacle": "GetObstacle()",
+                    "collision_status": "GetCollisionStatus()",
+                    "pose": "GetPose()",
+                    "angle": "GetAngle()",
+                    "mode": "RobotMode()",
+                }
+                if cmd in QUERY_MAP:
+                    resp = self._send_cmd(QUERY_MAP[cmd])
+                    conn.sendall(json.dumps({"status": "ok", "resp": resp}).encode() + b"\n")
+                    conn.close()
+                    continue
+
+                # ── 控制类命令 ──
+                if cmd == "enable":
+                    self._send_cmd("EnableRobot()")
+                    conn.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+                    conn.close()
+                    continue
+
+                if cmd == "stop":
+                    self._send_cmd("Stop()")
+                    conn.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+                    conn.close()
+                    continue
+
+                if cmd == "speed":
+                    ratio = int(req.get("ratio", 30))
+                    resp = self._send_cmd(f"SpeedFactor({ratio})")
+                    conn.sendall(json.dumps({"status": "ok", "resp": resp}).encode() + b"\n")
+                    conn.close()
+                    continue
+
                 # 默认: 坐标移动
                 x_mm = float(req["x"])
                 y_mm = float(req["y"])

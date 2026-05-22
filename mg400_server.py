@@ -261,6 +261,17 @@ class DashboardHandler:
             pos = self.e.obstacle_pos.copy()
         return f"{{active={1 if active else 0},pos={{{pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}}}}}"
 
+    def _cmd_GetCollisionStatus(self, args, kwargs):
+        """查询最近一次碰撞信息。无碰撞时返回 {collided=0}。"""
+        info = self.e.collision_info
+        if info is None:
+            return "{collided=0}"
+        return (f"{{collided=1,"
+                f"surf_dist_mm={info['surface_dist_mm']:.1f},"
+                f"tcp_world_mm={{{info['tcp_world_mm'][0]:.1f},{info['tcp_world_mm'][1]:.1f},{info['tcp_world_mm'][2]:.1f}}},"
+                f"tcp_base_mm={{{info['tcp_base_mm'][0]:.1f},{info['tcp_base_mm'][1]:.1f},{info['tcp_base_mm'][2]:.1f}}},"
+                f"obstacle_world_mm={{{info['obstacle_world_mm'][0]:.1f},{info['obstacle_world_mm'][1]:.1f},{info['obstacle_world_mm'][2]:.1f}}}}}")
+
     # ── 运动 ──
 
     def _cmd_MovJ(self, args, kwargs):
@@ -320,6 +331,7 @@ class DashboardHandler:
             self.e.wp_idx = 0 if self.e.waypoints else -1
             self.e.active = True
             self.e.reached = False
+            self.e.collision_info = None
 
         cid = self._next_id()
         return f"0,{{{cid}}}"
@@ -336,6 +348,7 @@ class DashboardHandler:
             self.e.joint_move = True
             self.e.active = True
             self.e.reached = False
+            self.e.collision_info = None
 
         cid = self._next_id()
         return f"0,{{{cid}}}"

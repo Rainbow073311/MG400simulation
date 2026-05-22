@@ -233,46 +233,13 @@ def _obstacle_segment(obs_pos, half_len):
     return a, b
 
 
-def _obstacle_distances(keypoints, obs_pos, obs_radius, half_len):
-    """计算机器人关键点到障碍物表面的距离 (m)。"""
-    a, b = _obstacle_segment(obs_pos, half_len)
-    dists = {}
-    for name, pt in keypoints.items():
-        seg_dist = _point_to_segment_dist(pt, a, b)
-        surf_dist = max(0.0, seg_dist - obs_radius)
-        dists[name] = {"center": seg_dist, "surface": surf_dist}
-    return dists
-
-
-def _obstacle_repulsion(tcp_pos, obs_pos, obs_radius, half_len, safe_dist=0.060, gain=0.08):
-    """计算障碍物对 TCP 的排斥向量 (世界坐标系, m)。
-    使用点到水平线段的距离, 模拟手臂横放。
-    safe_dist: 安全距离, 小于此距离开始排斥
-    gain: 排斥增益
-    返回 (repulsion_3d, min_surface_dist)"""
+def _check_obstacle_collision(tcp_pos, obs_pos, obs_radius, half_len, safe_dist=0.050):
+    """检查 TCP 是否进入障碍物安全范围 (50mm)。
+    返回 (collision_bool, surface_distance_m)。"""
     a, b = _obstacle_segment(obs_pos, half_len)
     seg_dist = _point_to_segment_dist(tcp_pos, a, b)
     surf_dist = max(0.0, seg_dist - obs_radius)
-    if surf_dist >= safe_dist:
-        return np.zeros(3), surf_dist
-    # 排斥方向: 线段上最近点指向TCP
-    ab = b - a
-    ap = tcp_pos - a
-    t = np.clip(np.dot(ap, ab) / np.dot(ab, ab) if np.dot(ab, ab) > 1e-12 else 0.0, 0.0, 1.0)
-    closest = a + t * ab
-    if seg_dist < 1e-6:
-        direction = np.array([0.0, 0.0, 1.0])
-    else:
-        direction = (tcp_pos - closest) / seg_dist
-    strength = gain * (1.0 - surf_dist / safe_dist) ** 2
-    return direction * strength, surf_dist
-
-
-def _check_path_blocked(waypoint, obs_pos, obs_radius, half_len, safe_dist=0.045):
-    """检查单个路径点是否被障碍物阻挡 (水平圆柱)。"""
-    a, b = _obstacle_segment(obs_pos, half_len)
-    dist = _point_to_segment_dist(np.asarray(waypoint), a, b)
-    return (dist - obs_radius) < safe_dist
+    return surf_dist < safe_dist, surf_dist
 
 
 # ── Win32 鼠标轮询（不设 GLFW 回调，不与 viewer 冲突）──
@@ -323,7 +290,7 @@ ext.obstacle_active = False  # 避障开关
 ext.obstacle_pos = np.zeros(3)  # 障碍物世界坐标 [x,y,z]
 ext.obstacle_radius = 0.025    # 障碍物圆柱半径 (m)
 ext.obstacle_half_length = 0.12 # 障碍物半长 (m), 沿局部X轴
-ext.last_replan_time = 0.0     # 上次重规划时间
+ext.collision_info = None    # 最近一次碰撞信息 dict 或 None
 
 def _tcp_server():
     """MG400 协议服务器已在 mg400_server.py 中, 此函数已移除。"""
@@ -632,48 +599,42 @@ def main():
                         J[:, 1] = jac_buf[:, 1] - jac_buf[:, 3] + jac_buf[:, 6] - jac_buf[:, 7]       # J2 + mimics
                         J[:, 2] = jac_buf[:, 2] - jac_buf[:, 4] + jac_buf[:, 8]                        # J3 + mimics
 
-                        # ── 障碍物排斥势场 ──
-                        obs_repulsion = np.zeros(3)
-                        obs_blocked = False
-                        if ext.obstacle_active:
-                            obs_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "obstacle")
-                            if obs_id >= 0:
-                                # 同步 mocap 位置 (ext.obstacle_pos 为权威源, 由 SetObstacle/键盘设置)
-                                obs_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "obstacle")
-                                if obs_body_id >= 0:
-                                    mocap_id = model.body_mocapid[obs_body_id]
-                                    data.mocap_pos[mocap_id] = ext.obstacle_pos.copy()
-                                # 读取实际 mocap 位置用于避障计算
-                                obs_pos = ext.obstacle_pos.copy()
-                                obs_repulsion, min_surf = _obstacle_repulsion(
-                                    tcp_pos, obs_pos, ext.obstacle_radius, ext.obstacle_half_length)
-                                # 检查所有剩余路径点是否被阻挡
-                                if ext.waypoints is not None and ext.wp_idx >= 0 and ext.wp_idx < len(ext.waypoints):
-                                    for ahead in range(ext.wp_idx, len(ext.waypoints)):
-                                        if _check_path_blocked(ext.waypoints[ahead], obs_pos, ext.obstacle_radius, ext.obstacle_half_length):
-                                            obs_blocked = True
-                                            break
+                        # ── 障碍物触碰检测 (安全距离 50mm, 触碰则暂停) ──
+                        if ext.obstacle_active and obs_mocap_id >= 0:
+                            obs_pos = ext.obstacle_pos
+                            collided, surf_dist = _check_obstacle_collision(
+                                tcp_pos, obs_pos, ext.obstacle_radius, ext.obstacle_half_length)
                             # 障碍物可视化: 靠近时变红
                             geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "obstacle_geom")
                             if geom_id >= 0:
-                                danger = 1.0 - min(min_surf / 0.060, 1.0)
-                                model.geom_rgba[geom_id] = [1.0, 0.2 * (1 - danger), 0.1 * (1 - danger),
-                                                            0.55 + danger * 0.45]
-                            # 路径点被阻挡 → 触发重规划 (检查当前路径是否被阻挡)
-                            now = data.time
-                            if obs_blocked and ext.active and ext.waypoints is not None \
-                                    and now - ext.last_replan_time > 0.8:
-                                ext.last_replan_time = now
-                                # 向上绕行: 在障碍物上方插入中间点
-                                mid_z = ext.obstacle_pos[2] + 0.12
-                                detour = [ext.waypoints[ext.wp_idx - 1][0] if ext.wp_idx > 0 else tcp_pos[0],
-                                          ext.waypoints[ext.wp_idx - 1][1] if ext.wp_idx > 0 else tcp_pos[1],
-                                          mid_z]
-                                new_segs = _plan_safe_motion(tcp_pos.tolist(), detour, verbose_prefix="避障绕行")
-                                remaining = _plan_safe_motion(detour, ext.target.tolist() if hasattr(ext.target, 'tolist') else ext.target)
-                                ext.waypoints = new_segs + remaining
-                                ext.wp_idx = 0
-                                print(f"  ⚠ 路径点被障碍阻挡 → 绕行 (抬升至 {mid_z*1000:.0f}mm)")
+                                if surf_dist < 0.050:
+                                    danger = 1.0 - surf_dist / 0.050
+                                    model.geom_rgba[geom_id] = [1.0, 0.2 * (1 - danger), 0.1 * (1 - danger),
+                                                                 0.55 + danger * 0.45]
+                                else:
+                                    model.geom_rgba[geom_id] = [1.0, 0.2, 0.1, 0.55]
+                            # 触碰 → 暂停运动, 清除路径点
+                            if collided and ext.active:
+                                tcp_world = data.site_xpos[tcp_site_id].copy()
+                                xb, yb, zb = mg400_server.world_to_base(tcp_world)
+                                print(f"\n  ⚠⚠⚠ 碰撞警报 ⚠⚠⚠")
+                                print(f"  机械臂TCP已进入障碍物安全范围 (表面距离 {surf_dist*1000:.0f}mm < 50mm)")
+                                print(f"  TCP当前位置 (世界): X={tcp_world[0]*1000:.1f} Y={tcp_world[1]*1000:.1f} Z={tcp_world[2]*1000:.1f} mm")
+                                print(f"  TCP当前位置 (基座): X={xb:.1f} Y={yb:.1f} Z={zb:.1f} mm")
+                                print(f"  障碍物位置 (世界): X={obs_pos[0]*1000:.1f} Y={obs_pos[1]*1000:.1f} Z={obs_pos[2]*1000:.1f} mm")
+                                print(f"  运动已暂停 — 请移开障碍物后重新发送目标!")
+                                print(f"  ═══════════════════════════════════")
+                                ext.collision_info = {
+                                    "collided": True,
+                                    "surface_dist_mm": surf_dist * 1000,
+                                    "tcp_world_mm": [tcp_world[0] * 1000, tcp_world[1] * 1000, tcp_world[2] * 1000],
+                                    "tcp_base_mm": [xb, yb, zb],
+                                    "obstacle_world_mm": [obs_pos[0] * 1000, obs_pos[1] * 1000, obs_pos[2] * 1000],
+                                }
+                                ext.active = False
+                                ext.target = None
+                                ext.waypoints = None
+                                ext.wp_idx = -1
 
                         # 关节限位感知: 处于限位且无法继续同向运动的关节从IK中排除
                         # _grad = error·J_col: _grad>0 → dq应为正; _grad<0 → dq应为负
@@ -725,7 +686,7 @@ def main():
                         elif dist > max_step * 2:
                             error = error / dist * max_step
 
-                        dq = J.T @ np.linalg.solve(A, error + obs_repulsion) + repulsion
+                        dq = J.T @ np.linalg.solve(A, error) + repulsion
 
                         # J1 方向校正: 局部梯度可能指向"短路径"(撞限位),
                         # 而全局正确路径需要J1反向旋转(经过0°到目标方位)
